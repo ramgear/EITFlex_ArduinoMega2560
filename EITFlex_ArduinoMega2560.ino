@@ -40,14 +40,14 @@
 #define RPM_ADJ_STEP 100
 
 // User define
-#define DEFAULT_FEATURE_EN B00100001;
+#define DEFAULT_FEATURE_EN B00000001;
 #define DEFAULT_USER_ADJ  20
 #define DEFAULT_RPM_ACC_ADJ  3
 #define DEFAULT_MAP_ACC_ADJ  3
 #define FUEL_ADJ_MAX_DUTY  80
 #define FUEL_ADJ_MIN  0
 #define FUEL_ADJ_MAX  35
-#define REV_PER_PULSE  1
+#define REV_PER_PULSE  2
 
 // Timing define
 #define THRD_SLEEP_MIN_US 10
@@ -57,21 +57,6 @@
 #define SYS_MON_PERIOD_MS 500
 #define WARMUP_TIME_S 60
 #define WARMUP_RPM 1000
-
-// EEPROM declaration
-#define EEPROM_EN_ADDR 0
-#define EEPROM_ACC_ADDR 1
-#define EEPROM_USER_ADDR 2
-#define EEPROM_SERIAL_ADDR 3
-#define EEPROM_RPM_COUNT_ADDR 50
-#define EEPROM_RPM_START_ADDR 50
-#define EEPROM_RPM_STEP_ADDR 50
-#define EEPROM_RPM_COUNT_ADDR 50
-#define EEPROM_RPM_START_ADDR 50
-#define EEPROM_RPM_STEP_ADDR 50
-#define EEPROM_ENG_WARMUP_TIME 50
-#define EEPROM_ENG_WARMUP_RPM 51
-#define EEPROM_MAP_ADDR 100
 
 #define CMD_HEADER_SIZE 4
 #define CMD_BUF_SIZE 32
@@ -1094,11 +1079,11 @@ void initEEPROM()
   // check MAP
   if(gEEPROM.config.map_count == 0xFF)
     gEEPROM.config.map_count = MAP_COUNT_MAX;
-  if(gEEPROM.config.map_start == 0xFFFF)
+  if(gEEPROM.config.map_start == 0xFF)
     gEEPROM.config.map_start = MAP_START;
-  if(gEEPROM.config.map_end == 0xFFFF)
+  if(gEEPROM.config.map_end == 0xFF)
     gEEPROM.config.map_end = MAP_END;
-  if(gEEPROM.config.map_adj_step == 0xFFFF)
+  if(gEEPROM.config.map_adj_step == 0xFF)
     gEEPROM.config.map_adj_step = MAP_ADJ_STEP;
     
   gEEPROM.config.map_step = (gEEPROM.config.map_end + gEEPROM.config.map_start)/gEEPROM.config.map_count;
