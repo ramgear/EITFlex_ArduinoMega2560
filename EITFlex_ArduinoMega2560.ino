@@ -1,7 +1,5 @@
 #include <NilRTOS.h>
 #include <NilSerial.h>
-#include <TimerOne.h>
-#include <TimerThree.h>
 #include <EEPROM.h>
 #include <stdarg.h>
 
