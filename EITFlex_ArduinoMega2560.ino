@@ -24,19 +24,19 @@
 #define MAP_MAX 100
 #define MAP_MIN 0
 #define MAP_COUNT_MAX 20
-#define MAP_COUNT 16
+#define MAP_COUNT MAP_COUNT_MAX
 #define MAP_START MAP_MIN
-#define MAP_END MAP_MAX
+#define MAP_STEP 5
 #define MAP_ADJ_STEP 20
 #define MAP_SENSOR_PIN A0
 
 // RPM declaration
 #define RPM_MAX 7500
 #define RPM_MIN 600
-#define RPM_COUNT_MAX 30
-#define RPM_COUNT 16
+#define RPM_COUNT_MAX 25
+#define RPM_COUNT RPM_COUNT_MAX
 #define RPM_START 800
-#define RPM_END 4000
+#define RPM_STEP 100
 #define RPM_ADJ_STEP 100
 
 // User define
@@ -1069,24 +1069,24 @@ void initEEPROM()
     gEEPROM.config.rpm_count = RPM_COUNT_MAX;
   if(gEEPROM.config.rpm_start == 0xFFFF)
     gEEPROM.config.rpm_start = RPM_START;
-  if(gEEPROM.config.rpm_end == 0xFFFF)
-    gEEPROM.config.rpm_end = RPM_END;
+  if(gEEPROM.config.rpm_step == 0xFFFF)
+    gEEPROM.config.rpm_step = RPM_STEP;
   if(gEEPROM.config.rpm_adj_step == 0xFFFF)
     gEEPROM.config.rpm_adj_step = RPM_ADJ_STEP;
     
-  gEEPROM.config.rpm_step = (gEEPROM.config.rpm_end + gEEPROM.config.rpm_start)/gEEPROM.config.rpm_count;
+  gEEPROM.config.rpm_end = gEEPROM.config.rpm_start + gEEPROM.config.rpm_step * gEEPROM.config.rpm_count;
 
   // check MAP
   if(gEEPROM.config.map_count == 0xFF)
     gEEPROM.config.map_count = MAP_COUNT_MAX;
   if(gEEPROM.config.map_start == 0xFF)
     gEEPROM.config.map_start = MAP_START;
-  if(gEEPROM.config.map_end == 0xFF)
-    gEEPROM.config.map_end = MAP_END;
+  if(gEEPROM.config.map_step == 0xFF)
+    gEEPROM.config.map_step = MAP_STEP;
   if(gEEPROM.config.map_adj_step == 0xFF)
     gEEPROM.config.map_adj_step = MAP_ADJ_STEP;
     
-  gEEPROM.config.map_step = (gEEPROM.config.map_end + gEEPROM.config.map_start)/gEEPROM.config.map_count;
+  gEEPROM.config.map_end = gEEPROM.config.map_start + gEEPROM.config.map_step * gEEPROM.config.map_count;
 
   // check engine
   if(gEEPROM.config.warmup_time == 0xFF)
