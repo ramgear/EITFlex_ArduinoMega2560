@@ -1574,20 +1574,33 @@ void processCmd()
       break;
       case CMD_READ_MAPPING:
         // read mapping buffer
-        rowIndex = *ptrReceiveData++;
-        colIndex = *ptrReceiveData;
+        address = *((uint16_t *)ptrReceiveData);
+        count = *(ptrReceiveData + 2);
         
-        if(isInMappingRange(rowIndex, colIndex))
-          *ptrResponseData = gEEPROM.fuel_map[rowIndex][colIndex];
+        if(address + count < gEEPROM.config.map_count * gEEPROM.config.rpm_count)
+        {
+          *ptrResponseData++ = *ptrReceiveData++;
+          *ptrResponseData++ = *ptrReceiveData++;
+          *ptrResponseData++ = *ptrReceiveData++;
+          
+          ptr = &gEEPROM.fuel_map[0][0] + address;
+          while(count--)
+            *ptrResponseData++ = *ptr++;
+        }
         else
           errCode = ERR_CMD_INDEX_OUT_OF_BOUNDS;
       break;
       case CMD_WRITE_MAPPING:      
-        rowIndex = *ptrReceiveData++;
-        colIndex = *ptrReceiveData++;
+        address = *((uint16_t *)ptrReceiveData);
+        count = *(ptrReceiveData + 2);
+        ptrReceiveData += 3;
         
-        if(isInMappingRange(rowIndex, colIndex))
-          gEEPROM.fuel_map[rowIndex][colIndex] = *ptrReceiveData;
+        if(address + count < gEEPROM.config.map_count * gEEPROM.config.rpm_count)
+        {
+          ptr = &gEEPROM.fuel_map[0][0] + address;
+          while(count--)
+            *ptr++ = *ptrReceiveData++;
+        }
         else
           errCode = ERR_CMD_INDEX_OUT_OF_BOUNDS;
       break;
