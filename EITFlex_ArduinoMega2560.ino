@@ -53,8 +53,8 @@
 #define TIMER_CHK_PERIOD_US 100000
 #define FUEL_ADJ_TIME_MS 500
 #define SYS_MON_PERIOD_MS 500
-#define WARMUP_TIME_S 60
-#define WARMUP_RPM 1000
+#define WARMUP_TIME_S 30
+#define WARMUP_RPM_LIMIT 1800
 
 #define CMD_HEADER_SIZE 4
 #define CMD_BUF_SIZE 32
@@ -143,7 +143,7 @@ typedef struct
   uint8_t maxAdj;
   
   // engine config
-  uint8_t warmup_time;
+  uint8_t warmup_time_s;
   uint16_t warmup_rpm;
   uint8_t rev_per_pulse;
   
@@ -188,19 +188,20 @@ typedef struct
   uint8_t FuelAdjust;
   uint8_t CurrentMAP;
   uint8_t CurrentMAPAcc;
-  uint8_t EngStartup;
-  uint8_t EngWarmupTimeS;
-  uint8_t EngIdling;
+  uint8_t EngineStarted;
+  uint8_t EngineWarming;
+  uint64_t EngineStartTime;
 } SysMon_t;
+
+typedef void (*NoArgFuncPtr)();
 
 // Function prototype
 // -------------------------
 void internalCommand(CMDs cmd,const void *data, const uint8_t len);
+void enableTimerS(uint8_t timeout, NoArgFuncPtr callback);
    
 // End of Function prototype
 // -------------------------
-
-typedef void (*NoArgFuncPtr)();
 
 // data type for fifo item
 typedef struct
@@ -587,6 +588,10 @@ volatile InjectorInfo_t gInjInfo[INJ_COUNT];
 
 EEPROM_Data_t gEEPROM;
 
+NoArgFuncPtr gTimerSCallback = NULL;
+uint64_t gTimerSCallCount = 0;
+uint8_t gTimerSTimeout = 0;
+
 // #########################################################################
 // -------------------------------------------------------------------------
 // InjectorHandler class
@@ -595,7 +600,7 @@ EEPROM_Data_t gEEPROM;
 
 class InjectorHandler
 {
-#define TIMER3_CALLBACK_MAX 3
+#define TIMER3_CALLBACK_MAX 5
 
 public:    
   static const uint8_t m_OutPins[INJ_COUNT];
@@ -634,8 +639,8 @@ public:
     gSysMon.AdjustTimeMs = FUEL_ADJ_TIME_MS;
     
     // Startup
-    gSysMon.EngStartup = 1;
-    gSysMon.EngIdling = 1;
+    gSysMon.EngineStarted = 0;
+    gSysMon.EngineWarming = 0;
     
     // test led
     pinMode(led, OUTPUT);
@@ -660,7 +665,11 @@ public:
   // ----------------------------------
   static void OnFuelAdjust()
   {
-    nilSemSignal(&semFuelAdjust);
+    // Adjust fuel only on engine started
+    if(gSysMon.EngineStarted)
+    {
+      nilSemSignal(&semFuelAdjust);
+    }
   }
   
   static void OnSysMon()
@@ -673,6 +682,14 @@ public:
     {
       internalCommand(CMD_INJECTOR_INFO, (const void *)&gInjInfo[0], sizeof(InjectorInfo_t));
     }
+  }
+  
+  static void OnWarmingTimeout()
+  {
+    // disable and clear timer counter
+    disableTimerS();
+      
+    gSysMon.EngineWarming = 0;
   }
   // ----------------------------------
   
@@ -704,7 +721,16 @@ public:
       
       // RPM & duty cycle calculation
       if(ptrInj->StartTime != 0 && timenow != ptrInj->StartTime)
-      {
+      {    
+        // Engine startup detected on 2nd cycle
+        if(!gSysMon.EngineStarted)
+        {
+          gSysMon.EngineStartTime = timenow;
+          gSysMon.EngineStarted = 1;
+          gSysMon.EngineWarming = 1;
+          enableTimerS(gEEPROM.config.warmup_time_s, OnWarmingTimeout);
+        }
+    
         ptrInj->CurrentRPM = 60000000L * gEEPROM.config.rev_per_pulse / (timenow - ptrInj->StartTime);
         ptrInj->CurrentDuty = (ptrInj->Period * 100 / (timenow - ptrInj->StartTime)) + 1;
         
@@ -863,80 +889,94 @@ NIL_THREAD(FuelAdjust,arg)
   volatile InjectorInfo_t *ptrInj = &gInjInfo[0];  // adjust by first injector info
   
   while (true) 
-  {    
+  {        
+    // wait next adjust request
+    nilSemWait(&semFuelAdjust);
+    
     if(gEEPROM.config.feature.en || gEEPROM.config.feature.mon)
     {      
       // adjust fuel by user
       gSysMon.FuelAdjust = gEEPROM.config.userAdj;
       
-      // read MAP value from sensor in voltage
-      mapVal = analogRead(MAP_SENSOR_PIN);
-      mapVal = map(mapVal, 0, 1023, 0, 100);  // convert to load 0 - 100 %
-      gSysMon.CurrentMAP = mapVal;
-        
-      // Process fuel adjust by MAP (load) acceleration change per second
-      if(gEEPROM.config.feature.map_acc)
+      if(gSysMon.EngineWarming)
       {
-        // Calculate acceleration
-        if(prevMAP != 0)
+        if(ptrInj->CurrentRPM > WARMUP_RPM_LIMIT)
         {
-          // calculate MAP change per second
-          gSysMon.CurrentMAPAcc = (gSysMon.CurrentMAP - prevMAP) * 1000 / gSysMon.AdjustTimeMs;
-          
-          // adjust on MAP change more than MAP step
-          if(abs(gSysMon.CurrentMAPAcc) >= gEEPROM.config.map_adj_step)
-          {            
-            // adjust fuel by acceleration
-            gSysMon.FuelAdjust += gEEPROM.config.mapAccAdj;
-          }
+          // Cancel warming when RPM more than limit
+          InjectorHandler::OnWarmingTimeout();
         }
-        prevMAP = gSysMon.CurrentMAP;
       }
+      else
+      {      
+        // read MAP value from sensor in voltage
+        mapVal = analogRead(MAP_SENSOR_PIN);
+        mapVal = map(mapVal, 0, 1023, 0, 100);  // convert to load 0 - 100 %
+        gSysMon.CurrentMAP = mapVal;
+          
+        // Process fuel adjust by MAP (load) acceleration change per second
+        if(gEEPROM.config.feature.map_acc)
+        {
+          // Calculate acceleration
+          if(prevMAP != 0)
+          {
+            // calculate MAP change per second
+            gSysMon.CurrentMAPAcc = (gSysMon.CurrentMAP - prevMAP) * 1000 / gSysMon.AdjustTimeMs;
+            
+            // adjust on MAP change more than MAP step
+            if(abs(gSysMon.CurrentMAPAcc) >= gEEPROM.config.map_adj_step)
+            {            
+              // adjust fuel by acceleration
+              gSysMon.FuelAdjust += gEEPROM.config.mapAccAdj;
+            }
+          }
+          prevMAP = gSysMon.CurrentMAP;
+        }
+          
+        // Process fuel adjust by RPM acceleration change per second
+        if(gEEPROM.config.feature.rpm_acc)
+        {        
+          // Calculate acceleration
+          if(prevRPM != 0)
+          {
+            // calculate RPM change per sec
+            ptrInj->CurrentRPMAcc = (ptrInj->CurrentRPM - prevRPM) * 1000 / gSysMon.AdjustTimeMs;
+            
+            // adjust on RPM change more than 100 RPM
+            if(abs(ptrInj->CurrentRPMAcc) >= gEEPROM.config.rpm_adj_step)
+            {            
+              // adjust fuel by acceleration
+              gSysMon.FuelAdjust += gEEPROM.config.rpmAccAdj;
+            }
+          }
+          prevRPM = ptrInj->CurrentRPM;
+        }
         
-      // Process fuel adjust by RPM acceleration change per second
-      if(gEEPROM.config.feature.rpm_acc)
-      {        
-        // Calculate acceleration
-        if(prevRPM != 0)
+        // Process fuel adjust by RPM and MAP(load) mapping
+        if(gEEPROM.config.feature.map)
         {
-          // calculate RPM change per sec
-          ptrInj->CurrentRPMAcc = (ptrInj->CurrentRPM - prevRPM) * 1000 / gSysMon.AdjustTimeMs;
-          
-          // adjust on RPM change more than 100 RPM
-          if(abs(ptrInj->CurrentRPMAcc) >= gEEPROM.config.rpm_adj_step)
-          {            
-            // adjust fuel by acceleration
-            gSysMon.FuelAdjust += gEEPROM.config.rpmAccAdj;
+          // MAP index looking
+          mapIndex = 0;
+          if(gSysMon.CurrentMAP >= gEEPROM.config.map_start)
+          {
+            mapIndex = ((gSysMon.CurrentMAP - gEEPROM.config.map_start)) / gEEPROM.config.map_step;
+            if(mapIndex >= gEEPROM.config.map_count )
+              mapIndex = gEEPROM.config.map_count - 1;
           }
+        
+          // RPM index looking
+          rpmIndex = 0;
+          if(ptrInj->CurrentRPM >= gEEPROM.config.rpm_start)
+          {
+            rpmIndex = (((float)(ptrInj->CurrentRPM - gEEPROM.config.rpm_start) * 10) / gEEPROM.config.rpm_step + 5)/10;    
+            if(rpmIndex < 0)
+              rpmIndex = 0;
+            else if(rpmIndex >= gEEPROM.config.rpm_count )
+              rpmIndex = gEEPROM.config.rpm_count - 1;
+          }
+            
+          // adjust fuel by mapping
+          gSysMon.FuelAdjust += gEEPROM.fuel_map[mapIndex][rpmIndex];
         }
-        prevRPM = ptrInj->CurrentRPM;
-      }
-      
-      // Process fuel adjust by RPM and MAP(load) mapping
-      if(gEEPROM.config.feature.map)
-      {
-        // MAP index looking
-        mapIndex = 0;
-        if(gSysMon.CurrentMAP >= gEEPROM.config.map_start)
-        {
-          mapIndex = ((gSysMon.CurrentMAP - gEEPROM.config.map_start)) / gEEPROM.config.map_step;
-          if(mapIndex >= gEEPROM.config.map_count )
-            mapIndex = gEEPROM.config.map_count - 1;
-        }
-      
-        // RPM index looking
-        rpmIndex = 0;
-        if(ptrInj->CurrentRPM >= gEEPROM.config.rpm_start)
-        {
-          rpmIndex = (((float)(ptrInj->CurrentRPM - gEEPROM.config.rpm_start) * 10) / gEEPROM.config.rpm_step + 5)/10;    
-          if(rpmIndex < 0)
-            rpmIndex = 0;
-          else if(rpmIndex >= gEEPROM.config.rpm_count )
-            rpmIndex = gEEPROM.config.rpm_count - 1;
-        }
-          
-        // adjust fuel by mapping
-        gSysMon.FuelAdjust += gEEPROM.fuel_map[mapIndex][rpmIndex];
       }
       
       // Trim fuel adjustment between minimum and maximum
@@ -948,9 +988,6 @@ NIL_THREAD(FuelAdjust,arg)
       if(gSysMon.FuelAdjust + ptrInj->CurrentDuty > FUEL_ADJ_MAX_DUTY)
         gSysMon.FuelAdjust = FUEL_ADJ_MAX_DUTY - ptrInj->CurrentDuty;      
     }
-    
-    // wait next adjust request
-    nilSemWait(&semFuelAdjust);
   }
 }
 
@@ -1008,6 +1045,19 @@ ISR(TIMER1_COMPA_vect)
 ISR(TIMER3_COMPA_vect)
 {
   injectors.OnTimer3Tick();
+}
+
+// Process on Timer4 interrupt
+ISR(TIMER4_COMPA_vect)
+{
+  if(++gTimerSCallCount >= gTimerSTimeout)
+  {
+    // disable timer on timeout
+    disableTimerS();
+    
+    if(gTimerSCallback != NULL)
+      gTimerSCallback();
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -1158,10 +1208,10 @@ void initEEPROM()
   gEEPROM.config.map_end = gEEPROM.config.map_start + gEEPROM.config.map_step * gEEPROM.config.map_count;
 
   // check engine
-  if(gEEPROM.config.warmup_time == 0xFF)
-    gEEPROM.config.warmup_time = WARMUP_TIME_S;
+  if(gEEPROM.config.warmup_time_s == 0xFF)
+    gEEPROM.config.warmup_time_s = WARMUP_TIME_S;
   if(gEEPROM.config.warmup_rpm == 0xFFFF)
-    gEEPROM.config.warmup_rpm = WARMUP_RPM;
+    gEEPROM.config.warmup_rpm = WARMUP_RPM_LIMIT;
   if(gEEPROM.config.rev_per_pulse == 0xFF)
     gEEPROM.config.rev_per_pulse = REV_PER_PULSE;
     
@@ -1217,6 +1267,29 @@ void initTimers()
   TCCR3B |= (1 << CS31);   // Set 8 prescaler (1 count = 0.5 us for 16MHz, 1 us for 8MHz)
   OCR3A = (TIMER_CHK_PERIOD_US << 1) - 1;  // set compare interrupt every TIMER_CHK_PERIOD_US us
   sbi(TIMSK3, OCIE3A);  // enable timer compare interrupt
+  
+  // initial Timer4 - for multi purpose using
+  TCCR4A = 0;  // reset register
+  TCCR4B = 0;  // reset register
+  TCNT4 = 0;   // reset counter
+  
+  TCCR4B |= (1 << WGM42);  // Enable CTC Mode
+  TCCR4B |= (1 << CS42) | (1 << CS40);   // Set 1024 prescaler (1 count = 64 us for 16MHz)
+  OCR4A = 15624;  // set compare interrupt in 1 s
+}
+
+void enableTimerS(uint8_t timeout, NoArgFuncPtr callback)
+{
+  gTimerSCallCount = 0;
+  gTimerSCallback = callback;  // set callback function
+  gTimerSTimeout = timeout;
+  sbi(TIMSK4, OCIE4A);  // enable timer compare interrupt
+}
+
+void disableTimerS()
+{
+  cbi(TIMSK4, OCIE4A);  // disable timer compare interrupt
+  gTimerSCallback = NULL;
 }
 
 void setup()
@@ -1481,7 +1554,7 @@ void processCmd()
     String param = "";
     
     // remove newline
-    cmdText.replace("\r\n", "");
+    cmdText.replace("\n", "");
       
     // convert command text to update case
     cmdText.toUpperCase();
