@@ -1240,14 +1240,6 @@ void setup()
   // Initial injectors
   injectors.Init();
   
-  // send system info on startup 
-  internalCommand(CMD_READ_CONFIGS, NULL, 0);
-  
-  // debug info
-  gBT.printf("Config Size: %d\r\n", sizeof(Config_t));
-  gBT.printf("SysMon Size: %d\r\n", sizeof(SysMon_t));
-  gBT.printf("InjInfo Size: %d\r\n", sizeof(InjectorInfo_t));
-  
   // enable interrupt
   sei();
   
