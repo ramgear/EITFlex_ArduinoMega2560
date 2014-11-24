@@ -103,6 +103,28 @@ enum ErrCodes
   ERR_CMD_INDEX_OUT_OF_BOUNDS,   // MAP/RPM mapping index out of bounds error
 };
 
+enum Prescalars
+{
+  PRESCAL_2 = 1,
+  PRESCAL_4,
+  PRESCAL_8,
+  PRESCAL_16,
+  PRESCAL_32,
+  PRESCAL_64,
+  PRESCAL_128,
+};
+
+enum Frequencies
+{
+  FREQ_8MHz = 1,
+  FREQ_4MHz,
+  FREQ_2MHz,
+  FREQ_1MHz,
+  FREQ_500kHz,
+  FREQ_250kHz,
+  FREQ_125kHz,
+};
+
 typedef struct
 {
     uint8_t en;
@@ -199,6 +221,55 @@ SEMAPHORE_DECL(semPWM, 0);
 SEMAPHORE_DECL(semFuelAdjust, 0);
 SEMAPHORE_DECL(semSendData, 0);
 
+// #########################################################################
+// -------------------------------------------------------------------------
+// System functions
+// -------------------------------------------------------------------------
+// #########################################################################
+
+/*
+Analog/Digital Convertion sampling rate
+16 MHz / 2 = 8 MHz
+16 MHz / 4 = 4 MHz
+16 MHz / 8 = 2 MHz
+16 MHz / 16 = 1 MHz
+16 MHz / 32 = 500 kHz
+16 MHz / 64 = 250 kHz
+16 MHz / 128 = 125 kHz
+*/
+void setAdcPrescal(uint8_t scal)
+{
+  ADCSRA &= B11111000;  // Clear prescale values
+  ADCSRA |= scal;
+}
+
+void setAdcFreq(uint8_t freq)
+{  
+  switch((Frequencies)freq)
+  {
+    case FREQ_8MHz:
+      setAdcPrescal(PRESCAL_2);
+    break;
+    case FREQ_4MHz:
+      setAdcPrescal(PRESCAL_4);
+    break;
+    case FREQ_2MHz:
+      setAdcPrescal(PRESCAL_8);
+    break;
+    case FREQ_1MHz:
+      setAdcPrescal(PRESCAL_16);
+    break;
+    case FREQ_500kHz:
+      setAdcPrescal(PRESCAL_32);
+    break;
+    case FREQ_250kHz:
+      setAdcPrescal(PRESCAL_64);
+    break;
+    case FREQ_125kHz:
+      setAdcPrescal(PRESCAL_128);
+    break;
+  }
+}
 
 // #########################################################################
 // -------------------------------------------------------------------------
@@ -1162,6 +1233,9 @@ void setup()
   
   // initial Timers
   initTimers();
+  
+  // initial ADC
+  setAdcFreq(FREQ_4MHz);
   
   // Initial injectors
   injectors.Init();
