@@ -59,7 +59,7 @@
 #define CMD_HEADER_SIZE 4
 #define CMD_BUF_SIZE 32
 
-#define MAX_CONFIG_COUNT 4
+#define MAX_PROFILE_COUNT 4
 
 #ifndef cbi
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
@@ -91,6 +91,8 @@ enum CMDs
   CMD_WRITE_BT_CFG,         // Write bluetooth config
   CMD_MONITOR_INFO,
   CMD_INJECTOR_INFO,
+  CMD_READ_PROFILE,         
+  CMD_WRITE_PROFILE,       
   CMD_END,
 };
 
@@ -125,12 +127,12 @@ enum Frequencies
   FREQ_125kHz,
 };
 
-enum Configs
+enum Profiles
 {
-  CFG_SYSTEM,
-  CFG_E20,
-  CFG_E85,
-  CFG_CUSTOM,
+  PROF_SYSTEM,
+  PROF_E20,
+  PROF_E85,
+  PROF_CUSTOM,
 };
 
 typedef struct
@@ -173,9 +175,9 @@ typedef struct
 
 typedef struct
 {
-  uint8_t current;
-  Config_t configs[MAX_CONFIG_COUNT];
-  uint8_t fuel_maps[MAX_CONFIG_COUNT][MAP_COUNT_MAX][RPM_COUNT_MAX];
+  uint8_t profile;
+  Config_t configs[MAX_PROFILE_COUNT];
+  uint8_t fuel_maps[MAX_PROFILE_COUNT][MAP_COUNT_MAX][RPM_COUNT_MAX];
 } EEPROM_Data_t;
 
 typedef struct
@@ -230,7 +232,7 @@ SEMAPHORE_DECL(semPWM, 0);
 SEMAPHORE_DECL(semFuelAdjust, 0);
 SEMAPHORE_DECL(semSendData, 0);
 
-EEPROM_Data_t gEEPROM;
+EEPROM_Data_t gProfiles;
 Config_t *gCurrentConfig = NULL;
 uint8_t *gCurrentMapping = NULL;
 
@@ -284,13 +286,14 @@ void setAdcFreq(uint8_t freq)
   }
 }
 
-bool setActiveConfig(uint8_t index)
+bool setProfile(uint8_t index)
 {
-  if(index >= MAX_CONFIG_COUNT)
+  if(index >= MAX_PROFILE_COUNT)
     return false;
     
-  gCurrentConfig = &gEEPROM.configs[index];
-  gCurrentMapping = &gEEPROM.fuel_maps[index][0][0];
+  gProfiles.profile = index;
+  gCurrentConfig = &gProfiles.configs[index];
+  gCurrentMapping = &gProfiles.fuel_maps[index][0][0];
   
   return true;
 }
@@ -1145,7 +1148,7 @@ void initSerial() {
 void readEEPROM()
 {
   uint16_t addr = 0;
-  uint8_t *ptr = (uint8_t *)&gEEPROM;
+  uint8_t *ptr = (uint8_t *)&gProfiles;
   uint16_t size = sizeof(EEPROM_Data_t);
   
   while(addr < size)
@@ -1155,7 +1158,7 @@ void readEEPROM()
 void writeEEPROM()
 {
   uint16_t addr = 0;
-  uint8_t *ptr = (uint8_t *)&gEEPROM;
+  uint8_t *ptr = (uint8_t *)&gProfiles;
   uint16_t size = sizeof(EEPROM_Data_t);
   
   while(addr < size)
@@ -1164,8 +1167,8 @@ void writeEEPROM()
 
 void writeEEPROM(void *addr, uint16_t size)
 {
-  uint8_t *ptr = (uint8_t *)&gEEPROM;
-  uint32_t offset = (uint32_t)&gEEPROM - (uint32_t)addr;
+  uint8_t *ptr = (uint8_t *)&gProfiles;
+  uint32_t offset = (uint32_t)&gProfiles - (uint32_t)addr;
   
   while(size--)
   {
@@ -1174,15 +1177,15 @@ void writeEEPROM(void *addr, uint16_t size)
   }
 }
 
-void initEEPROM()
+void initProfiles()
 {  
   // read EEPROM data into data structure
   readEEPROM();
   
   // Set current configuration
-  if(gEEPROM.current >= MAX_CONFIG_COUNT)
-    gEEPROM.current = (uint8_t)CFG_SYSTEM;    
-  setActiveConfig(gEEPROM.current);
+  if(gProfiles.profile >= MAX_PROFILE_COUNT)
+    gProfiles.profile = (uint8_t)PROF_SYSTEM;    
+  setProfile(gProfiles.profile);
  
   // check defualt value
   // -----------------------
@@ -1329,7 +1332,7 @@ void setup()
   cli();
   
   // load EEPROM data
-  initEEPROM();
+  initProfiles();
   
   // initial serial port
   initSerial();
@@ -1575,7 +1578,6 @@ void processCmd()
   ErrCodes errCode = ERR_NONE;
   volatile uint8_t *ptrReceiveData = cmdReceive.Package.data;
   volatile uint8_t *ptrResponseData = cmdResponse.Package.data;
-  volatile uint8_t *ptrMapping;
   uint32_t count;
   uint8_t *ptr;
   
@@ -1701,6 +1703,16 @@ void processCmd()
       break;
       case CMD_WRITE_BT_CFG:
         programBTSerial("EIT Flex", 115200, "1234");
+      break;
+      case CMD_READ_PROFILE:
+        *ptrResponseData = gProfiles.profile;
+      break;
+      case CMD_WRITE_PROFILE:
+        // set current profile
+        setProfile(*ptrReceiveData);
+        
+        // save to EEPROM
+        writeEEPROM(&gProfiles.profile, 1);
       break;
       default:
         errCode = ERR_CMD_NOT_FOUND;
