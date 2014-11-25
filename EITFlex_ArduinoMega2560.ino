@@ -59,6 +59,8 @@
 #define CMD_HEADER_SIZE 4
 #define CMD_BUF_SIZE 32
 
+#define MAX_CONFIG_COUNT 4
+
 #ifndef cbi
 #define cbi(sfr, bit) (_SFR_BYTE(sfr) &= ~_BV(bit))
 #endif
@@ -123,6 +125,14 @@ enum Frequencies
   FREQ_125kHz,
 };
 
+enum Configs
+{
+  CFG_SYSTEM,
+  CFG_E20,
+  CFG_E85,
+  CFG_CUSTOM,
+};
+
 typedef struct
 {
     uint8_t en;
@@ -159,13 +169,13 @@ typedef struct
   uint8_t map_end;
   uint8_t map_step;
   uint8_t map_adj_step;
-  
 } Config_t;
 
 typedef struct
 {
-  Config_t config;
-  uint8_t fuel_map[MAP_COUNT_MAX][RPM_COUNT_MAX];
+  uint8_t current;
+  Config_t configs[MAX_CONFIG_COUNT];
+  uint8_t fuel_maps[MAX_CONFIG_COUNT][MAP_COUNT_MAX][RPM_COUNT_MAX];
 } EEPROM_Data_t;
 
 typedef struct
@@ -220,6 +230,10 @@ SEMAPHORE_DECL(semPWM, 0);
 SEMAPHORE_DECL(semFuelAdjust, 0);
 SEMAPHORE_DECL(semSendData, 0);
 
+EEPROM_Data_t gEEPROM;
+Config_t *gCurrentConfig = NULL;
+uint8_t *gCurrentMapping = NULL;
+
 // #########################################################################
 // -------------------------------------------------------------------------
 // System functions
@@ -268,6 +282,17 @@ void setAdcFreq(uint8_t freq)
       setAdcPrescal(PRESCAL_128);
     break;
   }
+}
+
+bool setActiveConfig(uint8_t index)
+{
+  if(index >= MAX_CONFIG_COUNT)
+    return false;
+    
+  gCurrentConfig = &gEEPROM.configs[index];
+  gCurrentMapping = &gEEPROM.fuel_maps[index][0][0];
+  
+  return true;
 }
 
 // #########################################################################
@@ -519,7 +544,11 @@ public:
   // Print text with newline via bluetooth/serial
   _INLINE void println(String text)
   {
-    printf("%s\r\n", text);
+    char buf[SERIAL_BUF_SIZE];
+    memset(buf, 0, SERIAL_BUF_SIZE);
+    
+    text.toCharArray(buf, SERIAL_BUF_SIZE);
+    printf("%s\r\n", buf);
   }
   
   // Write raw data via bluetooth/serial
@@ -585,8 +614,6 @@ Queue PWMQueue = Queue(PWMItems, sizeof(PWMItem_t));
 
 volatile SysMon_t gSysMon;
 volatile InjectorInfo_t gInjInfo[INJ_COUNT];
-
-EEPROM_Data_t gEEPROM;
 
 NoArgFuncPtr gTimerSCallback = NULL;
 uint64_t gTimerSCallCount = 0;
@@ -674,11 +701,11 @@ public:
   
   static void OnSysMon()
   {
-    if(gEEPROM.config.feature.mon)
+    if(gCurrentConfig->feature.mon)
     {
       internalCommand(CMD_MONITOR_INFO, (const void *)&gSysMon, sizeof(SysMon_t));
     }
-    if(gEEPROM.config.feature.inj_mon)
+    if(gCurrentConfig->feature.inj_mon)
     {
       internalCommand(CMD_INJECTOR_INFO, (const void *)&gInjInfo[0], sizeof(InjectorInfo_t));
     }
@@ -695,7 +722,7 @@ public:
   
   _INLINE void WaitUntil(const uint8_t inj_no, const uint64_t &timenow, const uint64_t &time_off)
   {
-    if(gEEPROM.config.feature.en && (timenow + THRD_SLEEP_MIN_US < time_off))
+    if(gCurrentConfig->feature.en && (timenow + THRD_SLEEP_MIN_US < time_off))
     {
       InjOffItems[inj_no] = time_off;
       return;
@@ -728,10 +755,10 @@ public:
           gSysMon.EngineStartTime = timenow;
           gSysMon.EngineStarted = 1;
           gSysMon.EngineWarming = 1;
-          enableTimerS(gEEPROM.config.warmup_time_s, OnWarmingTimeout);
+          enableTimerS(gCurrentConfig->warmup_time_s, OnWarmingTimeout);
         }
     
-        ptrInj->CurrentRPM = 60000000L * gEEPROM.config.rev_per_pulse / (timenow - ptrInj->StartTime);
+        ptrInj->CurrentRPM = 60000000L * gCurrentConfig->rev_per_pulse / (timenow - ptrInj->StartTime);
         ptrInj->CurrentDuty = (ptrInj->Period * 100 / (timenow - ptrInj->StartTime)) + 1;
         
         // calculate critical time
@@ -893,10 +920,10 @@ NIL_THREAD(FuelAdjust,arg)
     // wait next adjust request
     nilSemWait(&semFuelAdjust);
     
-    if(gEEPROM.config.feature.en || gEEPROM.config.feature.mon)
+    if(gCurrentConfig->feature.en || gCurrentConfig->feature.mon)
     {      
       // adjust fuel by user
-      gSysMon.FuelAdjust = gEEPROM.config.userAdj;
+      gSysMon.FuelAdjust = gCurrentConfig->userAdj;
       
       if(gSysMon.EngineWarming)
       {
@@ -914,7 +941,7 @@ NIL_THREAD(FuelAdjust,arg)
         gSysMon.CurrentMAP = mapVal;
           
         // Process fuel adjust by MAP (load) acceleration change per second
-        if(gEEPROM.config.feature.map_acc)
+        if(gCurrentConfig->feature.map_acc)
         {
           // Calculate acceleration
           if(prevMAP != 0)
@@ -923,17 +950,17 @@ NIL_THREAD(FuelAdjust,arg)
             gSysMon.CurrentMAPAcc = (gSysMon.CurrentMAP - prevMAP) * 1000 / gSysMon.AdjustTimeMs;
             
             // adjust on MAP change more than MAP step
-            if(abs(gSysMon.CurrentMAPAcc) >= gEEPROM.config.map_adj_step)
+            if(abs(gSysMon.CurrentMAPAcc) >= gCurrentConfig->map_adj_step)
             {            
               // adjust fuel by acceleration
-              gSysMon.FuelAdjust += gEEPROM.config.mapAccAdj;
+              gSysMon.FuelAdjust += gCurrentConfig->mapAccAdj;
             }
           }
           prevMAP = gSysMon.CurrentMAP;
         }
           
         // Process fuel adjust by RPM acceleration change per second
-        if(gEEPROM.config.feature.rpm_acc)
+        if(gCurrentConfig->feature.rpm_acc)
         {        
           // Calculate acceleration
           if(prevRPM != 0)
@@ -942,40 +969,40 @@ NIL_THREAD(FuelAdjust,arg)
             ptrInj->CurrentRPMAcc = (ptrInj->CurrentRPM - prevRPM) * 1000 / gSysMon.AdjustTimeMs;
             
             // adjust on RPM change more than 100 RPM
-            if(abs(ptrInj->CurrentRPMAcc) >= gEEPROM.config.rpm_adj_step)
+            if(abs(ptrInj->CurrentRPMAcc) >= gCurrentConfig->rpm_adj_step)
             {            
               // adjust fuel by acceleration
-              gSysMon.FuelAdjust += gEEPROM.config.rpmAccAdj;
+              gSysMon.FuelAdjust += gCurrentConfig->rpmAccAdj;
             }
           }
           prevRPM = ptrInj->CurrentRPM;
         }
         
         // Process fuel adjust by RPM and MAP(load) mapping
-        if(gEEPROM.config.feature.map)
+        if(gCurrentConfig->feature.map)
         {
           // MAP index looking
           mapIndex = 0;
-          if(gSysMon.CurrentMAP >= gEEPROM.config.map_start)
+          if(gSysMon.CurrentMAP >= gCurrentConfig->map_start)
           {
-            mapIndex = ((gSysMon.CurrentMAP - gEEPROM.config.map_start)) / gEEPROM.config.map_step;
-            if(mapIndex >= gEEPROM.config.map_count )
-              mapIndex = gEEPROM.config.map_count - 1;
+            mapIndex = ((gSysMon.CurrentMAP - gCurrentConfig->map_start)) / gCurrentConfig->map_step;
+            if(mapIndex >= gCurrentConfig->map_count )
+              mapIndex = gCurrentConfig->map_count - 1;
           }
         
           // RPM index looking
           rpmIndex = 0;
-          if(ptrInj->CurrentRPM >= gEEPROM.config.rpm_start)
+          if(ptrInj->CurrentRPM >= gCurrentConfig->rpm_start)
           {
-            rpmIndex = (((float)(ptrInj->CurrentRPM - gEEPROM.config.rpm_start) * 10) / gEEPROM.config.rpm_step + 5)/10;    
+            rpmIndex = (((float)(ptrInj->CurrentRPM - gCurrentConfig->rpm_start) * 10) / gCurrentConfig->rpm_step + 5)/10;    
             if(rpmIndex < 0)
               rpmIndex = 0;
-            else if(rpmIndex >= gEEPROM.config.rpm_count )
-              rpmIndex = gEEPROM.config.rpm_count - 1;
+            else if(rpmIndex >= gCurrentConfig->rpm_count )
+              rpmIndex = gCurrentConfig->rpm_count - 1;
           }
             
           // adjust fuel by mapping
-          gSysMon.FuelAdjust += gEEPROM.fuel_map[mapIndex][rpmIndex];
+          gSysMon.FuelAdjust += *(gCurrentMapping + (mapIndex * gCurrentConfig->map_count + rpmIndex));
         }
       }
       
@@ -1151,6 +1178,11 @@ void initEEPROM()
 {  
   // read EEPROM data into data structure
   readEEPROM();
+  
+  // Set current configuration
+  if(gEEPROM.current >= MAX_CONFIG_COUNT)
+    gEEPROM.current = (uint8_t)CFG_SYSTEM;    
+  setActiveConfig(gEEPROM.current);
  
   // check defualt value
   // -----------------------
@@ -1159,7 +1191,7 @@ void initEEPROM()
   uint16_t addr;
   
   // features
-  ptr = (uint8_t *)&gEEPROM.config.feature;
+  ptr = (uint8_t *)&gCurrentConfig->feature;
   size = sizeof(Feature_t);
   addr = DEFAULT_FEATURE_EN;
   while(size--)
@@ -1172,65 +1204,65 @@ void initEEPROM()
   }
 
   // acc adjust
-  if(gEEPROM.config.rpmAccAdj == 0xFF)
-    gEEPROM.config.rpmAccAdj = DEFAULT_RPM_ACC_ADJ;
-  if(gEEPROM.config.mapAccAdj == 0xFF)
-    gEEPROM.config.mapAccAdj = DEFAULT_MAP_ACC_ADJ;
+  if(gCurrentConfig->rpmAccAdj == 0xFF)
+    gCurrentConfig->rpmAccAdj = DEFAULT_RPM_ACC_ADJ;
+  if(gCurrentConfig->mapAccAdj == 0xFF)
+    gCurrentConfig->mapAccAdj = DEFAULT_MAP_ACC_ADJ;
     
-  gEEPROM.config.maxAdj = FUEL_ADJ_MAX;
+  gCurrentConfig->maxAdj = FUEL_ADJ_MAX;
 
   // load user adjust
-  if(gEEPROM.config.userAdj == 0xFF)
-    gEEPROM.config.userAdj = DEFAULT_USER_ADJ;
+  if(gCurrentConfig->userAdj == 0xFF)
+    gCurrentConfig->userAdj = DEFAULT_USER_ADJ;
 
   // check RPM
-  if(gEEPROM.config.rpm_count == 0xFF)
-    gEEPROM.config.rpm_count = RPM_COUNT_MAX;
-  if(gEEPROM.config.rpm_start == 0xFFFF)
-    gEEPROM.config.rpm_start = RPM_START;
-  if(gEEPROM.config.rpm_step == 0xFFFF)
-    gEEPROM.config.rpm_step = RPM_STEP;
-  if(gEEPROM.config.rpm_adj_step == 0xFFFF)
-    gEEPROM.config.rpm_adj_step = RPM_ADJ_STEP;
+  if(gCurrentConfig->rpm_count == 0xFF)
+    gCurrentConfig->rpm_count = RPM_COUNT_MAX;
+  if(gCurrentConfig->rpm_start == 0xFFFF)
+    gCurrentConfig->rpm_start = RPM_START;
+  if(gCurrentConfig->rpm_step == 0xFFFF)
+    gCurrentConfig->rpm_step = RPM_STEP;
+  if(gCurrentConfig->rpm_adj_step == 0xFFFF)
+    gCurrentConfig->rpm_adj_step = RPM_ADJ_STEP;
     
-  gEEPROM.config.rpm_end = gEEPROM.config.rpm_start + gEEPROM.config.rpm_step * gEEPROM.config.rpm_count;
+  gCurrentConfig->rpm_end = gCurrentConfig->rpm_start + gCurrentConfig->rpm_step * gCurrentConfig->rpm_count;
 
   // check MAP
-  if(gEEPROM.config.map_count == 0xFF)
-    gEEPROM.config.map_count = MAP_COUNT_MAX;
-  if(gEEPROM.config.map_start == 0xFF)
-    gEEPROM.config.map_start = MAP_START;
-  if(gEEPROM.config.map_step == 0xFF)
-    gEEPROM.config.map_step = MAP_STEP;
-  if(gEEPROM.config.map_adj_step == 0xFF)
-    gEEPROM.config.map_adj_step = MAP_ADJ_STEP;
+  if(gCurrentConfig->map_count == 0xFF)
+    gCurrentConfig->map_count = MAP_COUNT_MAX;
+  if(gCurrentConfig->map_start == 0xFF)
+    gCurrentConfig->map_start = MAP_START;
+  if(gCurrentConfig->map_step == 0xFF)
+    gCurrentConfig->map_step = MAP_STEP;
+  if(gCurrentConfig->map_adj_step == 0xFF)
+    gCurrentConfig->map_adj_step = MAP_ADJ_STEP;
     
-  gEEPROM.config.map_end = gEEPROM.config.map_start + gEEPROM.config.map_step * gEEPROM.config.map_count;
+  gCurrentConfig->map_end = gCurrentConfig->map_start + gCurrentConfig->map_step * gCurrentConfig->map_count;
 
   // check engine
-  if(gEEPROM.config.warmup_time_s == 0xFF)
-    gEEPROM.config.warmup_time_s = WARMUP_TIME_S;
-  if(gEEPROM.config.warmup_rpm == 0xFFFF)
-    gEEPROM.config.warmup_rpm = WARMUP_RPM_LIMIT;
-  if(gEEPROM.config.rev_per_pulse == 0xFF)
-    gEEPROM.config.rev_per_pulse = REV_PER_PULSE;
+  if(gCurrentConfig->warmup_time_s == 0xFF)
+    gCurrentConfig->warmup_time_s = WARMUP_TIME_S;
+  if(gCurrentConfig->warmup_rpm == 0xFFFF)
+    gCurrentConfig->warmup_rpm = WARMUP_RPM_LIMIT;
+  if(gCurrentConfig->rev_per_pulse == 0xFF)
+    gCurrentConfig->rev_per_pulse = REV_PER_PULSE;
     
   // fuel map
-  ptr = (uint8_t *)&gEEPROM.fuel_map[0][0];
+  ptr = gCurrentMapping;
   size = MAP_COUNT_MAX * RPM_COUNT_MAX;
   addr = 0;
-  uint32_t ratio = (FUEL_ADJ_MAX - gEEPROM.config.userAdj) * 70 / gEEPROM.config.rpm_count;  // Ratio is 70% of adjust from different between maximum and manual adjust
+  uint32_t ratio = (FUEL_ADJ_MAX - gCurrentConfig->userAdj) * 70 / gCurrentConfig->rpm_count;  // Ratio is 70% of adjust from different between maximum and manual adjust
   uint8_t x;
   uint8_t y;
-  uint32_t aa = gEEPROM.config.rpm_count * gEEPROM.config.rpm_count;
-  uint32_t bb = gEEPROM.config.map_count * gEEPROM.config.map_count;
+  uint32_t aa = gCurrentConfig->rpm_count * gCurrentConfig->rpm_count;
+  uint32_t bb = gCurrentConfig->map_count * gCurrentConfig->map_count;
   while(addr < size)
   {
     if(*ptr == 0xFF)
     {
       // calculate default adjust using ellipse equation x*x/a*a + y*y/b*b = 1
-      x = addr % gEEPROM.config.rpm_count;
-      y = addr / gEEPROM.config.rpm_count;
+      x = addr % gCurrentConfig->rpm_count;
+      y = addr / gCurrentConfig->rpm_count;
       
       *ptr = (x*x/aa + y*y/bb) * ratio / 100;
     }
@@ -1449,7 +1481,7 @@ uint8_t calChkSum(const uint8_t *data, size_t count)
 // -------------------------------------------------------------------------
 bool isInMappingRange(int row, int col)
 {
-  return ((row >= 0 && row < gEEPROM.config.map_count) && (col >= 0 && col < gEEPROM.config.rpm_count));
+  return ((row >= 0 && row < gCurrentConfig->map_count) && (col >= 0 && col < gCurrentConfig->rpm_count));
 }
 
 // Send response package
@@ -1622,31 +1654,31 @@ void processCmd()
         memcpy((void *)ptrResponseData, (const void *)&gSysMon, sizeof(SysMon_t));
       break;
       case CMD_READ_CONFIGS:
-        ptr = (uint8_t *)&gEEPROM.config;
+        ptr = (uint8_t *)gCurrentConfig;
         count = sizeof(Config_t);
         while(count--)
           *ptrResponseData++ = *ptr++;
       break;
       case CMD_WRITE_CONFIGS:
-        ptr = (uint8_t *)&gEEPROM.config;
+        ptr = (uint8_t *)gCurrentConfig;
         count = sizeof(Config_t);
         while(count--)
           *ptr++ = *ptrReceiveData++;
           
-        writeEEPROM(&gEEPROM.config, sizeof(Config_t));
+        writeEEPROM(gCurrentConfig, sizeof(Config_t));
       break;
       case CMD_READ_MAPPING:
         // read mapping buffer
         address = *((uint16_t *)ptrReceiveData);
         count = *(ptrReceiveData + 2);
         
-        if(address + count < gEEPROM.config.map_count * gEEPROM.config.rpm_count)
+        if(address + count < gCurrentConfig->map_count * gCurrentConfig->rpm_count)
         {
           *ptrResponseData++ = *ptrReceiveData++;
           *ptrResponseData++ = *ptrReceiveData++;
           *ptrResponseData++ = *ptrReceiveData++;
           
-          ptr = &gEEPROM.fuel_map[0][0] + address;
+          ptr = gCurrentMapping + address;
           while(count--)
             *ptrResponseData++ = *ptr++;
         }
@@ -1658,9 +1690,9 @@ void processCmd()
         count = *(ptrReceiveData + 2);
         ptrReceiveData += 3;
         
-        if(address + count < gEEPROM.config.map_count * gEEPROM.config.rpm_count)
+        if(address + count < gCurrentConfig->map_count * gCurrentConfig->rpm_count)
         {
-          ptr = &gEEPROM.fuel_map[0][0] + address;
+          ptr = gCurrentMapping + address;
           while(count--)
             *ptr++ = *ptrReceiveData++;
         }
