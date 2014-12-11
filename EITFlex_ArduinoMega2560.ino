@@ -7,7 +7,7 @@
 
 // Serial communications
 //#define SERIAL_BT_DEV
-#define BTSerial Serial2
+#define BTSerial Serial3
 #define SysSerial Serial
 
 #define BT_MODE_PIN 15          // Enable programming mode for bluetooth device
@@ -38,7 +38,7 @@
 #define RPM_ADJ_STEP 100
 
 // User define
-#define DEFAULT_FEATURE_EN B00000001;
+#define DEFAULT_FEATURE_EN B00000000;
 #define DEFAULT_USER_ADJ  20
 #define DEFAULT_RPM_ACC_ADJ  3
 #define DEFAULT_MAP_ACC_ADJ  3
@@ -48,16 +48,17 @@
 #define REV_PER_PULSE  2
 
 // Timing define
-#define THRD_SLEEP_MIN_US 10
+#define THRD_SLEEP_MIN_US 100
+#define THRD_SLEEP_MAX_US 10000
 #define INJ_OFF_CHK_TIME_US 100
-#define TIMER_CHK_PERIOD_US 100000
+#define TIMER_CHK_PERIOD_US 10000
 #define FUEL_ADJ_TIME_MS 500
-#define SYS_MON_PERIOD_MS 500
+#define SYS_MON_PERIOD_MS 1000
 #define WARMUP_TIME_S 30
 #define WARMUP_RPM_LIMIT 1800
 
 #define CMD_HEADER_SIZE 4
-#define CMD_BUF_SIZE 32
+#define CMD_BUF_SIZE 64
 
 #define MAX_PROFILE_COUNT 4
 
@@ -204,6 +205,27 @@ typedef struct
   uint8_t EngineWarming;
   uint64_t EngineStartTime;
 } SysMon_t;
+// Data package declaration
+typedef union
+{
+  struct
+  {
+    uint8_t cmd;      // Command code
+    uint8_t type;     // 0 for request, 1 for response
+    uint8_t errCode;  // response error code
+    uint8_t chkSum;   // package checksum
+    uint8_t data[CMD_BUF_SIZE - CMD_HEADER_SIZE];  // data
+  } Package;
+  uint8_t  Buffer[CMD_BUF_SIZE];  // all package bytes
+} DataPackage_t;
+
+// data type for fifo item
+typedef struct
+{
+  uint8_t  inj_no;
+  uint32_t period;
+  uint64_t start_time;
+} PWMItem_t;
 
 typedef void (*NoArgFuncPtr)();
 
@@ -215,13 +237,11 @@ void enableTimerS(uint8_t timeout, NoArgFuncPtr callback);
 // End of Function prototype
 // -------------------------
 
-// data type for fifo item
-typedef struct
-{
-  uint8_t  inj_no;
-  uint32_t period;
-  uint64_t start_time;
-} PWMItem_t;
+// Receive data package
+volatile DataPackage_t cmdReceive;
+
+// Response data package
+volatile DataPackage_t cmdResponse;
 
 // #########################################################################
 // -------------------------------------------------------------------------
@@ -404,85 +424,97 @@ public:
 #define SERIAL_BUF_SIZE CMD_BUF_SIZE
 
 uint8_t qWData[SERIAL_BUF_SIZE * QUEUE_SIZE];
-Queue queue = Queue(qWData, SERIAL_BUF_SIZE);
+uint8_t qRData[SERIAL_BUF_SIZE * QUEUE_SIZE];
+Queue queueW = Queue(qWData, SERIAL_BUF_SIZE);
+Queue queueR = Queue(qRData, SERIAL_BUF_SIZE);
 
 class SerialBT
 {
 
   uint8_t modePin;
+  uint8_t sysBufIndex;
+  uint8_t btBufIndex;
+  char sysRBuf[SERIAL_BUF_SIZE];
   char btRBuf[SERIAL_BUF_SIZE];
   char btWBuf[SERIAL_BUF_SIZE];
   
   HardwareSerial *ptrSerial;
   HardwareSerial *ptrBTSerial;
   
-  bool connected;
-  bool mode;
-  Queue *ptrQ;
+  Queue *ptrQR;
+  Queue *ptrQW;
 
 private:
   
   _INLINE void queueWrite(const uint8_t *ptr, uint8_t len)
   {
-    if(!ptrQ->IsFull())
+    if(!ptrQW->IsFull())
     {
-      ptrQ->Push(ptr);
+      ptrQW->Push(ptr);
     }
   }
   
-  // Test bluetooth command
-  bool testCmd()
+  _INLINE void queueRead(const uint8_t *ptr, uint8_t len)
   {
-     String str;
-     bool ret = false;
-     
-     setAtMode(true);
-     
-     // send AT command to bluetooth
-     ptrBTSerial->println("AT");
-     
-     // read response from bluetooth
-     if(readString(ptrBTSerial, str, 3) && str == "OK")
-       ret = true;
-       
-     setAtMode(false);
-     
-     // send response to system when no response from bluetooth
-     if(!ret)
-       ptrSerial->println("No response from bluetooth device!");
-     
-     return ret;
-  }
-  
-  // Set bluetooth mode
-  void setAtMode(bool atMode)
-  {
-    mode = atMode;
-    digitalWrite(modePin, atMode ? HIGH : LOW);
+    if(!ptrQR->IsFull())
+    {
+      ptrQR->Push(ptr);
+    }
   }
   
 public:
+  volatile bool connected;
+  
   SerialBT(HardwareSerial *srSys, HardwareSerial *srBT, const uint8_t mode_pin)
   {
     ptrSerial = srSys;
     ptrBTSerial = srBT;
     modePin = mode_pin;
     connected = false;
-    ptrQ = &queue;
+    ptrQW = &queueW;
+    ptrQR = &queueR;
     
     pinMode(modePin, OUTPUT);
+    
+    sysBufIndex = 0;
+    btBufIndex = 0;
+    memset(btRBuf, 0, sizeof(btRBuf));
+    memset(sysRBuf, 0, sizeof(sysRBuf));
+  }
+  
+  void flush()
+  {
+    ptrBTSerial->flush();
+    ptrSerial->flush();
   }
   
   void sendData()
   {
-    if(!ptrQ->IsEmpty())
+    if(!ptrQW->IsEmpty())
     {
-      uint8_t *ptr = (uint8_t *)ptrQ->Pop();
+      uint8_t *ptr = (uint8_t *)ptrQW->Pop();
       
-      if(connected)
+      //if(connected)
         ptrBTSerial->write(ptr, SERIAL_BUF_SIZE);
-      else
-        ptrSerial->write(ptr, SERIAL_BUF_SIZE);
+      //else
+      //  ptrSerial->write(ptr, SERIAL_BUF_SIZE);
+    }
+  }
+  
+  void processReadData()
+  {
+    if(!ptrQR->IsEmpty())
+    {
+      uint8_t *ptr = (uint8_t *)ptrQR->Pop();
+      
+      // clear command
+      memset((void *)cmdReceive.Buffer, 0, sizeof(DataPackage_t));
+      
+      // copy received command
+      memcpy((void *)cmdReceive.Buffer, ptr, sizeof(DataPackage_t));
+      
+      // process command
+      processCmd();
     }
   }
   
@@ -493,42 +525,58 @@ public:
     ptrBTSerial->begin(speed);
   }
   
-  // Change bluetooth to command mode
-  void atModeOn()
+  bool sendATCommand(String cmd, bool waitResponse = false)
   {
-    println("Begin bluetooth command mode.");
-    printf("Changing baudrate to %ld\r\n", DEFUALT_BT_SERIAL_SPEED);
-    
-    ptrSerial->end();
-    ptrSerial->begin(DEFUALT_BT_SERIAL_SPEED);
-    
-    setAtMode(true);
+    ptrBTSerial->print(cmd);
+    if(waitResponse)
+      return chkResponse();
+      
+    return true;
   }
   
-  // Change bluetooth to data transfer mode
-  void atModeOff()
+  bool chkResponse(uint8_t retry = 3)
   {
-    println("End bluetooth command mode.");
-    printf("Changing baudrate to %ld\r\n", DEFUALT_SERIAL_SPEED);
+    char buf[32];
+    char *ptr;
     
-    ptrSerial->end();
-    ptrSerial->begin(DEFUALT_SERIAL_SPEED);
+    do
+    {
+      ptr = &buf[0];
+      memset(buf, 0, sizeof(buf));
+      
+      delay(550);
+      
+      while(ptrBTSerial->available())
+        *ptr++ = ptrBTSerial->read();
+      
+      String res = String(buf);      
+      if(res.startsWith("OK"))
+        return true;
+    }while(--retry);
     
-    setAtMode(false);
+    return false;
+  }
+  
+  bool setName(String name)
+  {
+    return sendATCommand("AT+NAME" + name);
+  }
+  
+  bool setPassword(String pwd)
+  {
+    return sendATCommand("AT+PIN" + pwd);
   }
   
   bool connect()
   {
-    //connected = testCmd();
+    connected = sendATCommand("AT", true);
     
+    if(connected)
+      ptrSerial->println("BT connected");
+    else
+      ptrSerial->println("BT not response!");
+      
     return connected;
-  }
-  
-  // Send command to bluetooth
-  void sendAtCmd(String cmd)
-  {
-     if(mode)
-       println(cmd);
   }
   
   // Print text with format via bluetooth/serial
@@ -560,47 +608,44 @@ public:
     queueWrite(buf, len);
   }
   
-  // Get available data from bluetooth
-  _INLINE bool available()
+  void readSerialData(HardwareSerial *serial, char *buf, uint8_t &index)
   {
-     return ptrBTSerial->available();
-  }
-  
-  // Read data from bluetooth
-  _INLINE char read()
-  {
-     return ptrBTSerial->read();
-  }
-  
-  // Read string from bluetooth
-  _INLINE bool readString(String &str, uint8_t retry = 1)
-  {
-    readString(ptrBTSerial, str, retry);
-  }
-  
-  // Read string from specify serial
-  _INLINE bool readString(HardwareSerial *serial, String &str, uint8_t retry = 1)
-  {
-    uint8_t idx = 0;
-    memset(btRBuf, 0, sizeof(btRBuf));
+    char *ptr = buf;
+    ptr += index;
     
-    do
-    {
-      while(serial->available())
-      {
-        btRBuf[idx++] = serial->read();
-      }
+    while (serial->available()) {
+      // get the new byte:
+      *ptr = serial->read(); 
       
-      if(idx == 0)
-        delay(1);
-    }while(--retry && idx);
-    
-    str = btRBuf;
-    
-    return (idx != 0);
+      if(*ptr == '\n' || (index + 1 == CMD_BUF_SIZE))
+      {                
+        // received CR LF then end package
+        queueRead((const uint8_t *)buf, index + 1);
+        
+        // clear buffer
+        memset(buf, 0, SERIAL_BUF_SIZE);
+        index = 0;
+        //serial->flush();
+      }
+      else
+      {
+        ptr++;
+        ++index;
+        if(index >= CMD_BUF_SIZE)
+          index = 0;
+      }
+    }
   }
   
+  void readSysSerial()
+  {
+    readSerialData(ptrSerial, sysRBuf, sysBufIndex);
+  }
   
+  void readBTSerial()
+  {
+    readSerialData(ptrBTSerial, btRBuf, btBufIndex);
+  }
 };
 
 // declare bluetooth object
@@ -696,20 +741,17 @@ public:
   static void OnFuelAdjust()
   {
     // Adjust fuel only on engine started
-    if(gSysMon.EngineStarted)
+    if(gSysMon.EngineStarted || gCurrentConfig->feature.mon)
     {
       nilSemSignal(&semFuelAdjust);
     }
   }
   
   static void OnSysMon()
-  {
+  {          
     if(gCurrentConfig->feature.mon)
     {
       internalCommand(CMD_MONITOR_INFO, (const void *)&gSysMon, sizeof(SysMon_t));
-    }
-    if(gCurrentConfig->feature.inj_mon)
-    {
       internalCommand(CMD_INJECTOR_INFO, (const void *)&gInjInfo[0], sizeof(InjectorInfo_t));
     }
   }
@@ -722,18 +764,6 @@ public:
     gSysMon.EngineWarming = 0;
   }
   // ----------------------------------
-  
-  _INLINE void WaitUntil(const uint8_t inj_no, const uint64_t &timenow, const uint64_t &time_off)
-  {
-    if(gCurrentConfig->feature.en && (timenow + THRD_SLEEP_MIN_US < time_off))
-    {
-      InjOffItems[inj_no] = time_off;
-      return;
-    }
-    
-    // No wait time detected then force off
-    InjOff(inj_no);
-  }
   
   _INLINE void OnStatChanged(uint8_t inj_index)
   {
@@ -777,10 +807,27 @@ public:
       pwm.period = (timenow - ptrInj->StartTime);
       pwm.start_time = ptrInj->StartTime;
       
-      ptrInj->Period = pwm.period;
-      
+      ptrInj->Period = (pwm.period * (100 + gSysMon.FuelAdjust) / 100);
+    
+#if (CRITICAL_TIME_LIMIT == TRUE)
+      if(ptrInj->Period > ptrInj->CriticalTimeUS)
+        ptrInj->Period = ptrInj->CriticalTimeUS;
+#endif
+    
+      if(gCurrentConfig->feature.en && (ptrInj->Period >= THRD_SLEEP_MIN_US) && (ptrInj->Period <= THRD_SLEEP_MAX_US))
+      {
+        InjOffItems[inj_index] = pwm.start_time + ptrInj->Period;
+      }
+      else
+      {
+        // No wait time detected then force off
+        InjOff(inj_index);
+      }
+      /*
       if(PWMQueue.Push((const void *)&pwm))
+      {
         nilSemSignal(&semPWM);
+      }*/
     }
   }
   
@@ -834,16 +881,17 @@ public:
   }
   
   void Start()
-  {
+  {    
     // Start Nil RTOS.
     nilSysBegin();
-    
+        
     // run forever to avoid function call
     while(true)
     {
-      SysSerialEvent();
-      BtSerial1Event();
+      gBT.readSysSerial();
+      gBT.readBTSerial();
       
+      gBT.processReadData();
       gBT.sendData();
     }
   }
@@ -871,14 +919,12 @@ static InjectorHandler injectors = InjectorHandler();
 // RTOS section
 // -------------------------------------------------------------------------
 // #########################################################################
-
+/*
 NIL_WORKING_AREA(waInjWaitTimeCal, 128); 
 NIL_THREAD(InjWaitTimeCal,arg)
 {
   const PWMItem_t *ptrPWM;
   volatile InjectorInfo_t *ptrInj;
-  uint64_t time_off;
-  uint64_t timenow;
   uint32_t period;
   
   while (true)
@@ -899,14 +945,19 @@ NIL_THREAD(InjWaitTimeCal,arg)
     if(period > ptrInj->CriticalTimeUS)
       period = ptrInj->CriticalTimeUS;
 #endif
-
-    time_off = ptrPWM->start_time + period;
-
-    timenow = micros();
-    injectors.WaitUntil(ptrPWM->inj_no, timenow, time_off);
+    
+    if(gCurrentConfig->feature.en && (period >= THRD_SLEEP_MIN_US) && (period <= THRD_SLEEP_MAX_US))
+    {
+      InjOffItems[ptrPWM->inj_no] = ptrPWM->start_time + period;
+    }
+    else
+    {
+      // No wait time detected then force off
+      injectors.InjOff(ptrPWM->inj_no);
+    }
   }
 }
-
+*/
 NIL_WORKING_AREA(waFuelAdjust, 128); 
 NIL_THREAD(FuelAdjust,arg)
 {
@@ -915,6 +966,7 @@ NIL_THREAD(FuelAdjust,arg)
   uint16_t mapVal;
   uint16_t prevRPM = 0;
   uint16_t prevMAP = 0;
+  float tmpFloat;
   
   volatile InjectorInfo_t *ptrInj = &gInjInfo[0];  // adjust by first injector info
   
@@ -1022,7 +1074,7 @@ NIL_THREAD(FuelAdjust,arg)
 }
 
 NIL_THREADS_TABLE_BEGIN()
-NIL_THREADS_TABLE_ENTRY("InjWaitTimeCal", InjWaitTimeCal, NULL, waInjWaitTimeCal, sizeof(waInjWaitTimeCal))
+//NIL_THREADS_TABLE_ENTRY("InjWaitTimeCal", InjWaitTimeCal, NULL, waInjWaitTimeCal, sizeof(waInjWaitTimeCal))
 NIL_THREADS_TABLE_ENTRY("FuelAdjust", FuelAdjust, NULL, waFuelAdjust, sizeof(waFuelAdjust))
 NIL_THREADS_TABLE_END()
 
@@ -1136,8 +1188,8 @@ void programBTSerial(const char *name, const uint32_t &buadrate, const char *psw
 // -------------------------------------------------------------------------
 void initSerial() {  
   // Initial bluetooth buadrate
-  gBT.setSpeed(DEFUALT_SERIAL_SPEED);
-  gBT.connect();
+  gBT.setSpeed(DEFUALT_SERIAL_SPEED);  
+  gBT.flush();
 }
 
 // #########################################################################
@@ -1177,13 +1229,11 @@ void writeEEPROM(void *addr, uint16_t size)
   }
 }
 
-void initProfiles()
-{  
-  // read EEPROM data into data structure
-  readEEPROM();
+void initProfile(bool reset = false)
+{
   
   // Set current configuration
-  if(gProfiles.profile >= MAX_PROFILE_COUNT)
+  if(reset || gProfiles.profile >= MAX_PROFILE_COUNT)
     gProfiles.profile = (uint8_t)PROF_SYSTEM;    
   setProfile(gProfiles.profile);
  
@@ -1207,47 +1257,47 @@ void initProfiles()
   }
 
   // acc adjust
-  if(gCurrentConfig->rpmAccAdj == 0xFF)
+  if(reset || gCurrentConfig->rpmAccAdj == 0xFF)
     gCurrentConfig->rpmAccAdj = DEFAULT_RPM_ACC_ADJ;
-  if(gCurrentConfig->mapAccAdj == 0xFF)
+  if(reset || gCurrentConfig->mapAccAdj == 0xFF)
     gCurrentConfig->mapAccAdj = DEFAULT_MAP_ACC_ADJ;
     
   gCurrentConfig->maxAdj = FUEL_ADJ_MAX;
 
   // load user adjust
-  if(gCurrentConfig->userAdj == 0xFF)
+  if(reset || gCurrentConfig->userAdj == 0xFF)
     gCurrentConfig->userAdj = DEFAULT_USER_ADJ;
 
   // check RPM
-  if(gCurrentConfig->rpm_count == 0xFF)
+  if(reset || gCurrentConfig->rpm_count == 0xFF)
     gCurrentConfig->rpm_count = RPM_COUNT_MAX;
-  if(gCurrentConfig->rpm_start == 0xFFFF)
+  if(reset || gCurrentConfig->rpm_start == 0xFFFF)
     gCurrentConfig->rpm_start = RPM_START;
-  if(gCurrentConfig->rpm_step == 0xFFFF)
+  if(reset || gCurrentConfig->rpm_step == 0xFFFF)
     gCurrentConfig->rpm_step = RPM_STEP;
-  if(gCurrentConfig->rpm_adj_step == 0xFFFF)
+  if(reset || gCurrentConfig->rpm_adj_step == 0xFFFF)
     gCurrentConfig->rpm_adj_step = RPM_ADJ_STEP;
     
   gCurrentConfig->rpm_end = gCurrentConfig->rpm_start + gCurrentConfig->rpm_step * gCurrentConfig->rpm_count;
 
   // check MAP
-  if(gCurrentConfig->map_count == 0xFF)
+  if(reset || gCurrentConfig->map_count == 0xFF)
     gCurrentConfig->map_count = MAP_COUNT_MAX;
-  if(gCurrentConfig->map_start == 0xFF)
+  if(reset || gCurrentConfig->map_start == 0xFF)
     gCurrentConfig->map_start = MAP_START;
-  if(gCurrentConfig->map_step == 0xFF)
+  if(reset || gCurrentConfig->map_step == 0xFF)
     gCurrentConfig->map_step = MAP_STEP;
-  if(gCurrentConfig->map_adj_step == 0xFF)
+  if(reset || gCurrentConfig->map_adj_step == 0xFF)
     gCurrentConfig->map_adj_step = MAP_ADJ_STEP;
     
   gCurrentConfig->map_end = gCurrentConfig->map_start + gCurrentConfig->map_step * gCurrentConfig->map_count;
 
   // check engine
-  if(gCurrentConfig->warmup_time_s == 0xFF)
+  if(reset || gCurrentConfig->warmup_time_s == 0xFF)
     gCurrentConfig->warmup_time_s = WARMUP_TIME_S;
-  if(gCurrentConfig->warmup_rpm == 0xFFFF)
+  if(reset || gCurrentConfig->warmup_rpm == 0xFFFF)
     gCurrentConfig->warmup_rpm = WARMUP_RPM_LIMIT;
-  if(gCurrentConfig->rev_per_pulse == 0xFF)
+  if(reset || gCurrentConfig->rev_per_pulse == 0xFF)
     gCurrentConfig->rev_per_pulse = REV_PER_PULSE;
     
   // fuel map
@@ -1273,6 +1323,14 @@ void initProfiles()
     ptr++;
     ++addr;
   }
+}
+
+void initProfiles()
+{  
+  // read EEPROM data into data structure
+  readEEPROM();
+  
+  initProfile();
 }
 // End of EEPROM section
 // -------------------------------------------------------------------------
@@ -1341,7 +1399,7 @@ void setup()
   initTimers();
   
   // initial ADC
-  setAdcFreq(FREQ_4MHz);
+  setAdcFreq(FREQ_1MHz);
   
   // Initial injectors
   injectors.Init();
@@ -1378,81 +1436,6 @@ void loop()
 // Data communication between Arduino Mega 2560 and serial interface
 // -------------------------------------------------------------------------
 // #########################################################################
-
-// Data package declaration
-typedef union
-{
-  struct
-  {
-    uint8_t cmd;      // Command code
-    uint8_t type;     // 0 for request, 1 for response
-    uint8_t errCode;  // response error code
-    uint8_t chkSum;   // package checksum
-    uint8_t data[CMD_BUF_SIZE - CMD_HEADER_SIZE];  // data
-  } Package;
-  uint8_t  Buffer[CMD_BUF_SIZE];  // all package bytes
-} DataPackage_t;
-
-// Receive data package
-volatile DataPackage_t cmdReceive;
-
-// Response data package
-volatile DataPackage_t cmdResponse;
-
-// Serial buffer index
-volatile uint8_t bufIndex = 0;
-
-char sysBuf[CMD_BUF_SIZE];
-uint8_t sysBufIndex = 0;
-
-// Receive data event from bluetooth serial
-// -------------------------------------------------------------------------
-void BtSerial1Event() {
-  while (BTSerial.available()) {
-    // get the new byte:
-    cmdReceive.Buffer[bufIndex] = BTSerial.read(); 
-    
-    if((bufIndex + 1 == CMD_BUF_SIZE) || cmdReceive.Buffer[bufIndex] == '\n')
-    {
-        // received CR LF then end package
-        processCmd();
-        bufIndex = 0;
-    }
-    else
-    {
-      ++bufIndex;
-      if(bufIndex >= CMD_BUF_SIZE)
-        bufIndex = 0;
-    }
-  }
-}
-
-// Receive data event from system serial
-// -------------------------------------------------------------------------
-void SysSerialEvent()
-{
-  while (SysSerial.available()) {
-    // get the new byte:
-    sysBuf[sysBufIndex] = SysSerial.read(); 
-    
-    if(sysBuf[sysBufIndex] == '\n')
-    {
-      if(sysBufIndex + 1 < CMD_BUF_SIZE)
-        sysBuf[sysBufIndex] = '\0';
-      memcpy((void *)cmdReceive.Buffer, sysBuf, sysBufIndex + 1);
-      
-      // received CR LF then end package
-      processCmd();
-      sysBufIndex = 0;
-    }
-    else
-    {
-      ++sysBufIndex;
-      if(sysBufIndex >= CMD_BUF_SIZE)
-        sysBufIndex = 0;
-    }
-  }
-}
 
 // Calculate package checksum
 // params:
@@ -1533,20 +1516,20 @@ void initCmdResponse()
 bool getNextParam(const String &cmdText, String &param, bool first = false)
 {
   static const char Separator = ',';
-  static int first_idx;
-  static int last_idx;
+  static int first_idx = 0;
+  static int last_idx = 0;
   
   if(first)
     first_idx = 0;
     
-  last_idx = cmdText.indexOf(Separator, first_idx + 1);
+  last_idx = cmdText.indexOf(Separator, first_idx);
   if(last_idx == -1)
-    last_idx = cmdText.length() - 1;
+    last_idx = cmdText.length();
     
   if(first_idx < last_idx)
   {
-    first_idx = last_idx;
     param = cmdText.substring(first_idx, last_idx);
+    first_idx = last_idx + 1;
     
     return true;
   }
@@ -1588,15 +1571,19 @@ void processCmd()
     String param = "";
     
     // remove newline
+    cmdText.replace("\r", "");
     cmdText.replace("\n", "");
       
     // convert command text to update case
     cmdText.toUpperCase();
     
-    if(param.substring(0, 2) == "AT")
+    if(cmdText.substring(0, 2) == "AT")
     {
-      // process blutooth AT Command
-      gBT.sendAtCmd(cmdText);
+      // process blutooth AT Command 
+      if(!gBT.sendATCommand(cmdText))
+      {
+        gBT.println("Failed!");
+      }
     }
     else
     {
@@ -1609,18 +1596,13 @@ void processCmd()
           getNextParam(cmdText, param);
           gBT.println(param);
         }
-        else if(strCmd == "BT_MODE")
-        {          
-          if(getNextParam(cmdText, param))
-          {
-            if(param == "1")
-              gBT.atModeOn();
-            else
-              gBT.atModeOff();
-          }
+        else if(strCmd == "ORG")
+        {
+          initProfile(true);
+          gBT.println("Reset to orignal.");
         }
         else
-          gBT.println("Command not found!");
+          gBT.println("Cmd '" + strCmd + "' not found!");
       }
     }
     
@@ -1709,10 +1691,13 @@ void processCmd()
       break;
       case CMD_WRITE_PROFILE:
         // set current profile
-        setProfile(*ptrReceiveData);
-        
-        // save to EEPROM
-        writeEEPROM(&gProfiles.profile, 1);
+        if(setProfile(*ptrReceiveData))
+        {        
+          // save to EEPROM
+          writeEEPROM(&gProfiles.profile, 1);
+        }
+        else
+          errCode = ERR_CMD_INDEX_OUT_OF_BOUNDS;
       break;
       default:
         errCode = ERR_CMD_NOT_FOUND;
