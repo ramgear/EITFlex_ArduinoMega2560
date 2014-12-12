@@ -1,5 +1,5 @@
 #include <NilRTOS.h>
-#include <NilSerial.h>
+//#include <NilSerial.h>
 #include <EEPROM.h>
 #include <stdarg.h>
 
@@ -17,6 +17,7 @@
 // Injector declaration
 #define INJ_COUNT 4
 #define INJ_ON_STAT LOW
+#define INJ_RPM_CHECK_NO 0
 
 // MAP declaration
 #define MAP_MAX 100
@@ -69,7 +70,7 @@
 #define sbi(sfr, bit) (_SFR_BYTE(sfr) |= _BV(bit))
 #endif
 
-#define CRITICAL_TIME_LIMIT FALSE
+#define CRITICAL_TIME_LIMIT TRUE
 
 enum Injs
 {
@@ -204,7 +205,12 @@ typedef struct
   uint8_t EngineStarted;
   uint8_t EngineWarming;
   uint64_t EngineStartTime;
+  uint16_t CurrentRPM;
+  uint16_t CurrentRPMAcc;
+  uint8_t CurrentDuty;
+  uint64_t CriticalTimeUS;
 } SysMon_t;
+
 // Data package declaration
 typedef union
 {
@@ -222,7 +228,6 @@ typedef union
 // data type for fifo item
 typedef struct
 {
-  uint8_t  inj_no;
   uint32_t period;
   uint64_t start_time;
 } PWMItem_t;
@@ -656,12 +661,9 @@ SerialBT gBT = SerialBT(&SysSerial, &BTSerial, BT_MODE_PIN);
 // #########################################################################
 
 // array of data items
-PWMItem_t PWMItems[QUEUE_SIZE];
 volatile uint64_t InjOffItems[QUEUE_SIZE];
-Queue PWMQueue = Queue(PWMItems, sizeof(PWMItem_t));
 
 volatile SysMon_t gSysMon;
-volatile InjectorInfo_t gInjInfo[INJ_COUNT];
 
 NoArgFuncPtr gTimerSCallback = NULL;
 uint64_t gTimerSCallCount = 0;
@@ -686,6 +688,8 @@ public:
   volatile NoArgFuncPtr m_Timer3CallbacksFunc[TIMER3_CALLBACK_MAX];
   volatile uint32_t m_Timer3CallbacksMask[TIMER3_CALLBACK_MAX];
   volatile size_t m_t3Count;
+  
+  volatile PWMItem_t mPWMs[INJ_COUNT];
   
   volatile uint8_t m_RPMCheckNo;
   
@@ -741,7 +745,7 @@ public:
   static void OnFuelAdjust()
   {
     // Adjust fuel only on engine started
-    if(gSysMon.EngineStarted || gCurrentConfig->feature.mon)
+    if(gSysMon.EngineStarted)
     {
       nilSemSignal(&semFuelAdjust);
     }
@@ -752,7 +756,6 @@ public:
     if(gCurrentConfig->feature.mon)
     {
       internalCommand(CMD_MONITOR_INFO, (const void *)&gSysMon, sizeof(SysMon_t));
-      internalCommand(CMD_INJECTOR_INFO, (const void *)&gInjInfo[0], sizeof(InjectorInfo_t));
     }
   }
   
@@ -767,67 +770,69 @@ public:
   
   _INLINE void OnStatChanged(uint8_t inj_index)
   {
-    static volatile uint64_t timenow;
-    static PWMItem_t pwm;
-    
-    volatile InjectorInfo_t *ptrInj = &gInjInfo[inj_index];
+    static uint64_t timenow;
+    static uint8_t stat;
+    uint32_t period;
+    static volatile PWMItem_t *ptrPWM = &mPWMs[inj_index];
     
     timenow = micros();
-    ptrInj->Stat = digitalRead(m_InPins[inj_index]);
+    stat = digitalRead(m_InPins[inj_index]);
     
-    if(ptrInj->Stat == INJ_ON_STAT)
+    if(stat == INJ_ON_STAT)
     {
+      // force injector on
       InjOn(inj_index);
       
-      // RPM & duty cycle calculation
-      if(ptrInj->StartTime != 0 && timenow != ptrInj->StartTime)
-      {    
-        // Engine startup detected on 2nd cycle
-        if(!gSysMon.EngineStarted)
-        {
-          gSysMon.EngineStartTime = timenow;
-          gSysMon.EngineStarted = 1;
-          gSysMon.EngineWarming = 1;
-          enableTimerS(gCurrentConfig->warmup_time_s, OnWarmingTimeout);
-        }
-    
-        ptrInj->CurrentRPM = 60000000L * gCurrentConfig->rev_per_pulse / (timenow - ptrInj->StartTime);
-        ptrInj->CurrentDuty = (ptrInj->Period * 100 / (timenow - ptrInj->StartTime)) + 1;
-        
-        // calculate critical time
-        if(ptrInj->CurrentRPM != 0)
-          ptrInj->CriticalTimeUS = 600000L * FUEL_ADJ_MAX_DUTY / ptrInj->CurrentRPM;
-      }
+      if(gCurrentConfig->feature.en)
+      {
+        // RPM & duty cycle calculation
+        if(inj_index == INJ_RPM_CHECK_NO && ptrPWM->start_time != 0 && timenow != ptrPWM->start_time)
+        {    
+          // Engine startup detected on 2nd cycle
+          if(!gSysMon.EngineStarted)
+          {
+            gSysMon.EngineStartTime = timenow;
+            gSysMon.EngineStarted = 1;
+            gSysMon.EngineWarming = 1;
+            enableTimerS(gCurrentConfig->warmup_time_s, OnWarmingTimeout);
+          }
       
-      ptrInj->StartTime = timenow;
+          gSysMon.CurrentRPM = 60000000L * gCurrentConfig->rev_per_pulse / (timenow - ptrPWM->start_time);
+          gSysMon.CurrentDuty = (ptrPWM->period * 100 / (timenow - ptrPWM->start_time)) + 1;
+          
+          // calculate critical time
+          if(gSysMon.CurrentRPM != 0)
+            gSysMon.CriticalTimeUS = 600000L * FUEL_ADJ_MAX_DUTY / gSysMon.CurrentRPM;
+        }
+        
+        ptrPWM->start_time = timenow;
+      }
     }
     else
     {
-      pwm.inj_no = inj_index;
-      pwm.period = (timenow - ptrInj->StartTime);
-      pwm.start_time = ptrInj->StartTime;
-      
-      ptrInj->Period = (pwm.period * (100 + gSysMon.FuelAdjust) / 100);
-    
-#if (CRITICAL_TIME_LIMIT == TRUE)
-      if(ptrInj->Period > ptrInj->CriticalTimeUS)
-        ptrInj->Period = ptrInj->CriticalTimeUS;
-#endif
-    
-      if(gCurrentConfig->feature.en && (ptrInj->Period >= THRD_SLEEP_MIN_US) && (ptrInj->Period <= THRD_SLEEP_MAX_US))
+      if(!gCurrentConfig->feature.en)
       {
-        InjOffItems[inj_index] = pwm.start_time + ptrInj->Period;
-      }
-      else
-      {
-        // No wait time detected then force off
         InjOff(inj_index);
       }
-      /*
-      if(PWMQueue.Push((const void *)&pwm))
-      {
-        nilSemSignal(&semPWM);
-      }*/
+      else
+      {      
+        ptrPWM->period = ((timenow - ptrPWM->start_time) * (100 + gSysMon.FuelAdjust) / 100);
+      
+  #if (CRITICAL_TIME_LIMIT == TRUE)
+        if(gSysMon.CriticalTimeUS != 0 && ptrPWM->period > gSysMon.CriticalTimeUS)
+          ptrPWM->period = gSysMon.CriticalTimeUS;
+  #endif
+      
+        if(ptrPWM->period >= THRD_SLEEP_MIN_US && ptrPWM->period <= THRD_SLEEP_MAX_US)
+        {
+          InjOffItems[inj_index] = ptrPWM->start_time + ptrPWM->period;
+        }
+        else
+        {
+          // No wait time detected then force off
+          InjOff(inj_index);
+        }
+      }
     }
   }
   
@@ -919,45 +924,7 @@ static InjectorHandler injectors = InjectorHandler();
 // RTOS section
 // -------------------------------------------------------------------------
 // #########################################################################
-/*
-NIL_WORKING_AREA(waInjWaitTimeCal, 128); 
-NIL_THREAD(InjWaitTimeCal,arg)
-{
-  const PWMItem_t *ptrPWM;
-  volatile InjectorInfo_t *ptrInj;
-  uint32_t period;
-  
-  while (true)
-  {
-    nilSemWait(&semPWM);
-    
-    ptrPWM = (const PWMItem_t *)PWMQueue.Pop();
-    if(ptrPWM == NULL)
-      continue;
-    
-    // Get injector infomation
-    ptrInj = &gInjInfo[ptrPWM->inj_no];
-    
-    // calculate wait time
-    period = (ptrPWM->period * (100 + gSysMon.FuelAdjust) / 100);
-    
-#if (CRITICAL_TIME_LIMIT == TRUE)
-    if(period > ptrInj->CriticalTimeUS)
-      period = ptrInj->CriticalTimeUS;
-#endif
-    
-    if(gCurrentConfig->feature.en && (period >= THRD_SLEEP_MIN_US) && (period <= THRD_SLEEP_MAX_US))
-    {
-      InjOffItems[ptrPWM->inj_no] = ptrPWM->start_time + period;
-    }
-    else
-    {
-      // No wait time detected then force off
-      injectors.InjOff(ptrPWM->inj_no);
-    }
-  }
-}
-*/
+
 NIL_WORKING_AREA(waFuelAdjust, 128); 
 NIL_THREAD(FuelAdjust,arg)
 {
@@ -967,8 +934,6 @@ NIL_THREAD(FuelAdjust,arg)
   uint16_t prevRPM = 0;
   uint16_t prevMAP = 0;
   float tmpFloat;
-  
-  volatile InjectorInfo_t *ptrInj = &gInjInfo[0];  // adjust by first injector info
   
   while (true) 
   {        
@@ -982,7 +947,7 @@ NIL_THREAD(FuelAdjust,arg)
       
       if(gSysMon.EngineWarming)
       {
-        if(ptrInj->CurrentRPM > WARMUP_RPM_LIMIT)
+        if(gSysMon.CurrentRPM > WARMUP_RPM_LIMIT)
         {
           // Cancel warming when RPM more than limit
           InjectorHandler::OnWarmingTimeout();
@@ -1021,16 +986,16 @@ NIL_THREAD(FuelAdjust,arg)
           if(prevRPM != 0)
           {
             // calculate RPM change per sec
-            ptrInj->CurrentRPMAcc = (ptrInj->CurrentRPM - prevRPM) * 1000 / gSysMon.AdjustTimeMs;
+            gSysMon.CurrentRPMAcc = (gSysMon.CurrentRPM - prevRPM) * 1000 / gSysMon.AdjustTimeMs;
             
             // adjust on RPM change more than 100 RPM
-            if(abs(ptrInj->CurrentRPMAcc) >= gCurrentConfig->rpm_adj_step)
+            if(abs(gSysMon.CurrentRPMAcc) >= gCurrentConfig->rpm_adj_step)
             {            
               // adjust fuel by acceleration
               gSysMon.FuelAdjust += gCurrentConfig->rpmAccAdj;
             }
           }
-          prevRPM = ptrInj->CurrentRPM;
+          prevRPM = gSysMon.CurrentRPM;
         }
         
         // Process fuel adjust by RPM and MAP(load) mapping
@@ -1047,9 +1012,9 @@ NIL_THREAD(FuelAdjust,arg)
         
           // RPM index looking
           rpmIndex = 0;
-          if(ptrInj->CurrentRPM >= gCurrentConfig->rpm_start)
+          if(gSysMon.CurrentRPM >= gCurrentConfig->rpm_start)
           {
-            rpmIndex = (((float)(ptrInj->CurrentRPM - gCurrentConfig->rpm_start) * 10) / gCurrentConfig->rpm_step + 5)/10;    
+            rpmIndex = (((float)(gSysMon.CurrentRPM - gCurrentConfig->rpm_start) * 10) / gCurrentConfig->rpm_step + 5)/10;    
             if(rpmIndex < 0)
               rpmIndex = 0;
             else if(rpmIndex >= gCurrentConfig->rpm_count )
@@ -1067,14 +1032,13 @@ NIL_THREAD(FuelAdjust,arg)
       else if(gSysMon.FuelAdjust < FUEL_ADJ_MIN)
         gSysMon.FuelAdjust = FUEL_ADJ_MIN;
         
-      if(gSysMon.FuelAdjust + ptrInj->CurrentDuty > FUEL_ADJ_MAX_DUTY)
-        gSysMon.FuelAdjust = FUEL_ADJ_MAX_DUTY - ptrInj->CurrentDuty;      
+      if(gSysMon.FuelAdjust + gSysMon.CurrentDuty > FUEL_ADJ_MAX_DUTY)
+        gSysMon.FuelAdjust = FUEL_ADJ_MAX_DUTY - gSysMon.CurrentDuty;      
     }
   }
 }
 
 NIL_THREADS_TABLE_BEGIN()
-//NIL_THREADS_TABLE_ENTRY("InjWaitTimeCal", InjWaitTimeCal, NULL, waInjWaitTimeCal, sizeof(waInjWaitTimeCal))
 NIL_THREADS_TABLE_ENTRY("FuelAdjust", FuelAdjust, NULL, waFuelAdjust, sizeof(waFuelAdjust))
 NIL_THREADS_TABLE_END()
 
@@ -1309,6 +1273,7 @@ void initProfile(bool reset = false)
   uint8_t y;
   uint32_t aa = gCurrentConfig->rpm_count * gCurrentConfig->rpm_count;
   uint32_t bb = gCurrentConfig->map_count * gCurrentConfig->map_count;
+  float ftmp;
   while(addr < size)
   {
     if(*ptr == 0xFF)
@@ -1317,7 +1282,8 @@ void initProfile(bool reset = false)
       x = addr % gCurrentConfig->rpm_count;
       y = addr / gCurrentConfig->rpm_count;
       
-      *ptr = (x*x/aa + y*y/bb) * ratio / 100;
+      ftmp = (x*x/aa + y*y/bb) * ratio / 100;
+      *ptr = (uint8_t)ftmp;
     }
       
     ptr++;
@@ -1399,7 +1365,7 @@ void setup()
   initTimers();
   
   // initial ADC
-  setAdcFreq(FREQ_1MHz);
+  setAdcFreq(FREQ_4MHz);
   
   // Initial injectors
   injectors.Init();
@@ -1656,7 +1622,7 @@ void processCmd()
         address = *((uint16_t *)ptrReceiveData);
         count = *(ptrReceiveData + 2);
         
-        if(address + count < gCurrentConfig->map_count * gCurrentConfig->rpm_count)
+        if(address + count <= gCurrentConfig->map_count * gCurrentConfig->rpm_count)
         {
           *ptrResponseData++ = *ptrReceiveData++;
           *ptrResponseData++ = *ptrReceiveData++;
@@ -1674,7 +1640,7 @@ void processCmd()
         count = *(ptrReceiveData + 2);
         ptrReceiveData += 3;
         
-        if(address + count < gCurrentConfig->map_count * gCurrentConfig->rpm_count)
+        if(address + count <= gCurrentConfig->map_count * gCurrentConfig->rpm_count)
         {
           ptr = gCurrentMapping + address;
           while(count--)
