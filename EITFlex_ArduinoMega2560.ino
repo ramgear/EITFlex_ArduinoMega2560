@@ -1031,6 +1031,8 @@ NIL_THREAD(FuelAdjust,arg)
         gSysMon.FuelAdjust = FUEL_ADJ_MAX;
       else if(gSysMon.FuelAdjust < FUEL_ADJ_MIN)
         gSysMon.FuelAdjust = FUEL_ADJ_MIN;
+      else if(gSysMon.FuelAdjust > gCurrentConfig->maxAdj)
+        gSysMon.FuelAdjust = gCurrentConfig->maxAdj;
         
       if(gSysMon.FuelAdjust + gSysMon.CurrentDuty > FUEL_ADJ_MAX_DUTY)
         gSysMon.FuelAdjust = FUEL_ADJ_MAX_DUTY - gSysMon.CurrentDuty;      
@@ -1226,7 +1228,8 @@ void initProfile(bool reset = false)
   if(reset || gCurrentConfig->mapAccAdj == 0xFF)
     gCurrentConfig->mapAccAdj = DEFAULT_MAP_ACC_ADJ;
     
-  gCurrentConfig->maxAdj = FUEL_ADJ_MAX;
+  if(reset || gCurrentConfig->maxAdj == 0xFF)
+    gCurrentConfig->maxAdj = FUEL_ADJ_MAX;
 
   // load user adjust
   if(reset || gCurrentConfig->userAdj == 0xFF)
